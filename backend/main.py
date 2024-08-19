@@ -1,126 +1,118 @@
 import base64
+import inspect
+import json
+import logging
+import mimetypes
+import os
+import shutil
+import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import List, Optional
 
-from authlib.integrations.starlette_client import OAuth
-from authlib.oidc.core import UserInfo
-import json
-import time
-import os
-import sys
-import logging
 import aiohttp
 import requests
-import mimetypes
-import shutil
-import inspect
-
-from fastapi import FastAPI, Request, Depends, status, UploadFile, File, Form
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
-from fastapi import HTTPException
+from apps.audio.main import app as audio_app
+from apps.images.main import app as images_app
+from apps.ollama.main import app as ollama_app
+from apps.ollama.main import (
+    generate_openai_chat_completion as generate_ollama_chat_completion,
+)
+from apps.ollama.main import get_all_models as get_ollama_models
+from apps.openai.main import app as openai_app
+from apps.openai.main import generate_chat_completion as generate_openai_chat_completion
+from apps.openai.main import get_all_models as get_openai_models
+from apps.rag.main import app as rag_app
+from apps.rag.utils import get_rag_context, rag_template
+from apps.socket.main import app as socket_app
+from apps.socket.main import get_event_call, get_event_emitter
+from apps.webui.internal.db import Session
+from apps.webui.main import app as webui_app
+from apps.webui.main import generate_function_chat_completion, get_pipe_models
+from apps.webui.models.auths import Auths
+from apps.webui.models.functions import Functions
+from apps.webui.models.models import Models
+from apps.webui.models.tools import Tools
+from apps.webui.models.users import Users
+from apps.webui.utils import load_function_module_by_id, load_toolkit_module_by_id
+from authlib.integrations.starlette_client import OAuth
+from authlib.oidc.core import UserInfo
+from config import (
+    CACHE_DIR,
+    CHANGELOG,
+    DEFAULT_LOCALE,
+    ENABLE_ADMIN_CHAT_ACCESS,
+    ENABLE_ADMIN_EXPORT,
+    ENABLE_MODEL_FILTER,
+    ENABLE_OAUTH_SIGNUP,
+    ENABLE_OLLAMA_API,
+    ENABLE_OPENAI_API,
+    ENV,
+    FRONTEND_BUILD_DIR,
+    GLOBAL_LOG_LEVEL,
+    MODEL_FILTER_LIST,
+    OAUTH_MERGE_ACCOUNTS_BY_EMAIL,
+    OAUTH_PROVIDERS,
+    SAFE_MODE,
+    SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE,
+    SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD,
+    SRC_LOG_LEVELS,
+    STATIC_DIR,
+    TASK_MODEL,
+    TASK_MODEL_EXTERNAL,
+    TITLE_GENERATION_PROMPT_TEMPLATE,
+    TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
+    VERSION,
+    WEBHOOK_URL,
+    WEBUI_AUTH,
+    WEBUI_BUILD_HASH,
+    WEBUI_NAME,
+    WEBUI_SECRET_KEY,
+    WEBUI_SESSION_COOKIE_SAME_SITE,
+    WEBUI_SESSION_COOKIE_SECURE,
+    WEBUI_URL,
+    AppConfig,
+)
+from constants import ERROR_MESSAGES, TASKS, WEBHOOK_MESSAGES
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.responses import StreamingResponse, Response, RedirectResponse
-
-
-from apps.socket.main import app as socket_app, get_event_emitter, get_event_call
-from apps.ollama.main import (
-    app as ollama_app,
-    get_all_models as get_ollama_models,
-    generate_openai_chat_completion as generate_ollama_chat_completion,
+from starlette.responses import RedirectResponse, Response, StreamingResponse
+from utils.misc import (
+    add_or_update_system_message,
+    get_last_user_message,
+    parse_duration,
+    prepend_to_first_user_message_content,
 )
-from apps.openai.main import (
-    app as openai_app,
-    get_all_models as get_openai_models,
-    generate_chat_completion as generate_openai_chat_completion,
+from utils.task import (
+    search_query_generation_template,
+    title_generation_template,
+    tools_function_calling_generation_template,
 )
-
-from apps.audio.main import app as audio_app
-from apps.images.main import app as images_app
-from apps.rag.main import app as rag_app
-from apps.webui.main import (
-    app as webui_app,
-    get_pipe_models,
-    generate_function_chat_completion,
-)
-from apps.webui.internal.db import Session
-
-
-from pydantic import BaseModel
-from typing import List, Optional
-
-from apps.webui.models.auths import Auths
-from apps.webui.models.models import Models
-from apps.webui.models.tools import Tools
-from apps.webui.models.functions import Functions
-from apps.webui.models.users import Users
-
-from apps.webui.utils import load_toolkit_module_by_id, load_function_module_by_id
-
 from utils.utils import (
+    create_token,
     get_admin_user,
-    get_verified_user,
     get_current_user,
     get_http_authorization_cred,
     get_password_hash,
-    create_token,
+    get_verified_user,
 )
-from utils.task import (
-    title_generation_template,
-    search_query_generation_template,
-    tools_function_calling_generation_template,
-)
-from utils.misc import (
-    get_last_user_message,
-    add_or_update_system_message,
-    prepend_to_first_user_message_content,
-    parse_duration,
-)
-
-from apps.rag.utils import get_rag_context, rag_template
-
-from config import (
-    WEBUI_NAME,
-    WEBUI_URL,
-    WEBUI_AUTH,
-    ENV,
-    VERSION,
-    CHANGELOG,
-    FRONTEND_BUILD_DIR,
-    CACHE_DIR,
-    STATIC_DIR,
-    DEFAULT_LOCALE,
-    ENABLE_OPENAI_API,
-    ENABLE_OLLAMA_API,
-    ENABLE_MODEL_FILTER,
-    MODEL_FILTER_LIST,
-    GLOBAL_LOG_LEVEL,
-    SRC_LOG_LEVELS,
-    WEBHOOK_URL,
-    ENABLE_ADMIN_EXPORT,
-    WEBUI_BUILD_HASH,
-    TASK_MODEL,
-    TASK_MODEL_EXTERNAL,
-    TITLE_GENERATION_PROMPT_TEMPLATE,
-    SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE,
-    SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD,
-    TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
-    SAFE_MODE,
-    OAUTH_PROVIDERS,
-    ENABLE_OAUTH_SIGNUP,
-    OAUTH_MERGE_ACCOUNTS_BY_EMAIL,
-    WEBUI_SECRET_KEY,
-    WEBUI_SESSION_COOKIE_SAME_SITE,
-    WEBUI_SESSION_COOKIE_SECURE,
-    ENABLE_ADMIN_CHAT_ACCESS,
-    AppConfig,
-)
-
-from constants import ERROR_MESSAGES, WEBHOOK_MESSAGES, TASKS
 from utils.webhook import post_webhook
 
 if SAFE_MODE:
@@ -163,8 +155,8 @@ https://github.com/open-webui/open-webui
 
 def run_migrations():
     try:
-        from alembic.config import Config
         from alembic import command
+        from alembic.config import Config
 
         alembic_cfg = Config("alembic.ini")
         command.upgrade(alembic_cfg, "head")
@@ -2307,3 +2299,14 @@ else:
     log.warning(
         f"Frontend build directory not found at '{FRONTEND_BUILD_DIR}'. Serving API only."
     )
+
+def main():
+    # 设置默认端口
+    port = int(os.getenv('PORT', '8080'))
+    
+    # 启动应用
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
+if __name__ == "__main__":
+    main()
